@@ -35,6 +35,18 @@ public class MessageFlowAnalyzer
         public string HangfireJobClass { get; set; }
     }
 
+    public class MessageEventSubscription
+    {
+        public string EventName { get; set; }
+        public string Repository { get; set; }
+        public string Project { get; set; }
+        public string FilePath { get; set; }
+        public string SubscriptionType { get; set; } // "ServiceCollection", "EventBus", etc.
+        public int LineNumber { get; set; }
+        public string CodeContext { get; set; }
+        public bool IsInHangfireJob { get; set; }
+    }
+
     public class MessageConsumer
     {
         public string EventName { get; set; }
@@ -52,6 +64,7 @@ public class MessageFlowAnalyzer
         public List<MessageEventDefinition> Events { get; set; } = new();
         public List<MessagePublisher> Publishers { get; set; } = new();
         public List<MessageConsumer> Consumers { get; set; } = new();
+        public List<MessageEventSubscription> Subscriptions { get; set; } = new();
         public DateTime AnalyzedAt { get; set; }
         public int RepositoriesScanned { get; set; }
         public int ProjectsScanned { get; set; }
@@ -138,6 +151,7 @@ public class MessageFlowAnalyzer
             report.Events.AddRange(repoResult.Events);
             report.Publishers.AddRange(repoResult.Publishers);
             report.Consumers.AddRange(repoResult.Consumers);
+            report.Subscriptions.AddRange(repoResult.Subscriptions);
             report.ProjectsScanned += repoResult.ProjectsScanned;
         }
 
@@ -244,6 +258,15 @@ public class MessageFlowAnalyzer
         }
 
         Console.WriteLine($"  Found {report.Consumers.Count} consumers");
+
+        // Step 4: Find all event subscriptions (service registrations)
+        foreach (var file in csFiles)
+        {
+            var subscriptions = await AnalyzeEventSubscriptionsAsync(file, repoName, includeDetails);
+            report.Subscriptions.AddRange(subscriptions);
+        }
+
+        Console.WriteLine($"  Found {report.Subscriptions.Count} event subscriptions");
 
         return report;
     }
@@ -436,9 +459,17 @@ public class MessageFlowAnalyzer
         var content = await File.ReadAllTextAsync(filePath);
         var lines = content.Split('\n');
 
+        // Only look for actual IIntegrationEventHandler implementations, not service registrations
         var handlerRegex = new Regex(@"IIntegrationEventHandler<(\w+)>", RegexOptions.IgnoreCase);
         var classRegex = new Regex(@"public\s+class\s+(\w+)");
         var handleMethodRegex = new Regex(@"public\s+(?:async\s+)?(?:Task|void)\s+Handle\s*\(");
+
+        // Skip files that are clearly startup/configuration files
+        var fileName = Path.GetFileName(filePath).ToLower();
+        if (fileName.Contains("startup") || fileName.Contains("program") || fileName.Contains("configuration"))
+        {
+            return consumers; // Don't analyze these as consumers
+        }
 
         string currentClass = "";
         bool isInHangfireJob = IsHangfireRelated(content);
@@ -447,7 +478,7 @@ public class MessageFlowAnalyzer
         {
             var line = lines[i].Trim();
 
-            // Find handler implementations
+            // Find handler implementations (actual classes, not registrations)
             var handlerMatch = handlerRegex.Match(line);
             if (handlerMatch.Success)
             {
@@ -464,43 +495,133 @@ public class MessageFlowAnalyzer
                     }
                 }
 
-                // Find the Handle method and extract some logic
-                var handlerLogic = new List<string>();
-                if (includeDetails)
+                // Only add if this is an actual class implementation, not a service registration
+                if (!string.IsNullOrEmpty(currentClass) && !IsServiceRegistrationContext(lines, i))
                 {
-                    for (int j = i; j < lines.Length && j < i + 50; j++)
+                    // Find the Handle method and extract some logic
+                    var handlerLogic = new List<string>();
+                    if (includeDetails)
                     {
-                        if (handleMethodRegex.Match(lines[j]).Success)
+                        for (int j = i; j < lines.Length && j < i + 50; j++)
                         {
-                            // Extract next 10-15 lines of the Handle method
-                            for (int k = j + 1; k < lines.Length && k < j + 15; k++)
+                            if (handleMethodRegex.Match(lines[j]).Success)
                             {
-                                var logicLine = lines[k].Trim();
-                                if (logicLine.StartsWith("}") && !logicLine.Contains("{"))
-                                    break;
-                                if (!string.IsNullOrWhiteSpace(logicLine))
-                                    handlerLogic.Add(logicLine);
+                                // Extract next 10-15 lines of the Handle method
+                                for (int k = j + 1; k < lines.Length && k < j + 15; k++)
+                                {
+                                    var logicLine = lines[k].Trim();
+                                    if (logicLine.StartsWith("}") && !logicLine.Contains("{"))
+                                        break;
+                                    if (!string.IsNullOrWhiteSpace(logicLine))
+                                        handlerLogic.Add(logicLine);
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
-                }
 
-                consumers.Add(new MessageConsumer
+                    consumers.Add(new MessageConsumer
+                    {
+                        EventName = eventName,
+                        Repository = repoName,
+                        Project = GetProjectNameFromPath(filePath),
+                        FilePath = filePath,
+                        HandlerClass = currentClass,
+                        HandlerMethod = "Handle",
+                        IsInHangfireJob = isInHangfireJob,
+                        HandlerLogic = handlerLogic
+                    });
+                }
+            }
+        }
+
+        return consumers;
+    }
+
+    private async Task<List<MessageEventSubscription>> AnalyzeEventSubscriptionsAsync(string filePath, string repoName, bool includeDetails)
+    {
+        var subscriptions = new List<MessageEventSubscription>();
+        var content = await File.ReadAllTextAsync(filePath);
+        var lines = content.Split('\n');
+
+        // Look for service collection registrations and event bus subscriptions
+        var serviceRegistrationRegex = new Regex(@"\.AddTransient<IIntegrationEventHandler<(\w+)>", RegexOptions.IgnoreCase);
+        var serviceRegistrationRegex2 = new Regex(@"\.AddScoped<IIntegrationEventHandler<(\w+)>", RegexOptions.IgnoreCase);
+        var serviceRegistrationRegex3 = new Regex(@"\.AddSingleton<IIntegrationEventHandler<(\w+)>", RegexOptions.IgnoreCase);
+        var eventBusSubscriptionRegex = new Regex(@"\.Subscribe<(\w+)>", RegexOptions.IgnoreCase);
+        var eventBusSubscriptionRegex2 = new Regex(@"\.SubscribeAsync<(\w+)>", RegexOptions.IgnoreCase);
+
+        bool isInHangfireJob = IsHangfireRelated(content);
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].Trim();
+
+            // Check for service collection registrations
+            var serviceMatch = serviceRegistrationRegex.Match(line) ?? 
+                              serviceRegistrationRegex2.Match(line) ?? 
+                              serviceRegistrationRegex3.Match(line);
+            
+            if (serviceMatch != null && serviceMatch.Success)
+            {
+                var eventName = serviceMatch.Groups[1].Value;
+                var context = includeDetails ? GetCodeContext(lines, i, 2) : line.Trim();
+
+                subscriptions.Add(new MessageEventSubscription
                 {
                     EventName = eventName,
                     Repository = repoName,
                     Project = GetProjectNameFromPath(filePath),
                     FilePath = filePath,
-                    HandlerClass = currentClass,
-                    HandlerMethod = "Handle",
-                    IsInHangfireJob = isInHangfireJob,
-                    HandlerLogic = handlerLogic
+                    SubscriptionType = "ServiceCollection",
+                    LineNumber = i + 1,
+                    CodeContext = context,
+                    IsInHangfireJob = isInHangfireJob
+                });
+            }
+
+            // Check for event bus subscriptions
+            var eventBusMatch = eventBusSubscriptionRegex.Match(line) ?? 
+                               eventBusSubscriptionRegex2.Match(line);
+            
+            if (eventBusMatch != null && eventBusMatch.Success)
+            {
+                var eventName = eventBusMatch.Groups[1].Value;
+                var context = includeDetails ? GetCodeContext(lines, i, 2) : line.Trim();
+
+                subscriptions.Add(new MessageEventSubscription
+                {
+                    EventName = eventName,
+                    Repository = repoName,
+                    Project = GetProjectNameFromPath(filePath),
+                    FilePath = filePath,
+                    SubscriptionType = "EventBus",
+                    LineNumber = i + 1,
+                    CodeContext = context,
+                    IsInHangfireJob = isInHangfireJob
                 });
             }
         }
 
-        return consumers;
+        return subscriptions;
+    }
+
+    private bool IsServiceRegistrationContext(string[] lines, int currentIndex)
+    {
+        // Check if we're in a service registration context (like Startup.cs ConfigureServices method)
+        for (int i = Math.Max(0, currentIndex - 10); i <= Math.Min(lines.Length - 1, currentIndex + 3); i++)
+        {
+            var line = lines[i].ToLower();
+            if (line.Contains("configureservices") || 
+                line.Contains("addtransient") || 
+                line.Contains("addscoped") || 
+                line.Contains("addsingleton") ||
+                line.Contains("services."))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private string ExtractEventNameFromVariable(string[] lines, int publishLineIndex, string variableName)
@@ -573,6 +694,7 @@ public class MessageFlowAnalyzer
         Console.WriteLine($"Integration Events Found: {report.Events.Count}");
         Console.WriteLine($"Publishers Found: {report.Publishers.Count}");
         Console.WriteLine($"Consumers Found: {report.Consumers.Count}");
+        Console.WriteLine($"Subscriptions Found: {report.Subscriptions.Count}");
         Console.WriteLine();
 
         // Group events with their publishers and consumers
@@ -585,6 +707,10 @@ public class MessageFlowAnalyzer
             var consumers = report.Consumers.Where(c => 
                 c.EventName.Equals(evt.Name, StringComparison.OrdinalIgnoreCase) ||
                 c.EventName.Contains(evt.Name)).ToList();
+
+            var subscriptions = report.Subscriptions.Where(s => 
+                s.EventName.Equals(evt.Name, StringComparison.OrdinalIgnoreCase) ||
+                s.EventName.Contains(evt.Name)).ToList();
 
             Console.WriteLine($"[EVENT] {evt.Name}");
             Console.WriteLine($"   Repository: {evt.Repository}");
@@ -621,6 +747,16 @@ public class MessageFlowAnalyzer
             else
             {
                 Console.WriteLine($"   [CONSUMED BY]: *** NO CONSUMERS FOUND ***");
+            }
+
+            if (subscriptions.Any())
+            {
+                Console.WriteLine($"   [SUBSCRIPTIONS]:");
+                foreach (var sub in subscriptions)
+                {
+                    var hangfireInfo = sub.IsInHangfireJob ? " [HANGFIRE]" : "";
+                    Console.WriteLine($"      - {sub.Repository}/{sub.Project} - {sub.SubscriptionType}{hangfireInfo}");
+                }
             }
             Console.WriteLine();
         }
@@ -754,7 +890,7 @@ public class MessageFlowAnalyzer
         // Header comments
         aql.AppendLine("// Message Flow Analysis - ArangoDB AQL Script");
         aql.AppendLine($"// Generated: {report.AnalyzedAt:yyyy-MM-dd HH:mm:ss}");
-        aql.AppendLine($"// Repositories: {report.RepositoriesScanned}, Events: {report.Events.Count}, Publishers: {report.Publishers.Count}, Consumers: {report.Consumers.Count}");
+        aql.AppendLine($"// Repositories: {report.RepositoriesScanned}, Events: {report.Events.Count}, Publishers: {report.Publishers.Count}, Consumers: {report.Consumers.Count}, Subscriptions: {report.Subscriptions.Count}");
         aql.AppendLine();
         aql.AppendLine("// Instructions:");
         aql.AppendLine("// 1. Create a new database in ArangoDB (e.g., 'messageflow')");
@@ -772,14 +908,17 @@ public class MessageFlowAnalyzer
         aql.AppendLine("db._createDocumentCollection('events');");
         aql.AppendLine("db._createDocumentCollection('publishers');");
         aql.AppendLine("db._createDocumentCollection('consumers');");
+        aql.AppendLine("db._createDocumentCollection('subscriptions');");
         aql.AppendLine();
         aql.AppendLine("// Create edge collections (relationships)");
         aql.AppendLine("db._createEdgeCollection('contains');      // Repository -> Service");
         aql.AppendLine("db._createEdgeCollection('defines');       // Service -> Event");
         aql.AppendLine("db._createEdgeCollection('publishes');     // Publisher -> Event");
         aql.AppendLine("db._createEdgeCollection('consumes');      // Consumer -> Event");
+        aql.AppendLine("db._createEdgeCollection('subscribes');    // Subscription -> Event");
         aql.AppendLine("db._createEdgeCollection('hasPublisher');  // Service -> Publisher");
         aql.AppendLine("db._createEdgeCollection('hasConsumer');   // Service -> Consumer");
+        aql.AppendLine("db._createEdgeCollection('hasSubscription'); // Service -> Subscription");
         aql.AppendLine();
 
         // Clear existing data
@@ -790,12 +929,15 @@ public class MessageFlowAnalyzer
         aql.AppendLine("// FOR doc IN events REMOVE doc IN events");
         aql.AppendLine("// FOR doc IN publishers REMOVE doc IN publishers");
         aql.AppendLine("// FOR doc IN consumers REMOVE doc IN consumers");
+        aql.AppendLine("// FOR doc IN subscriptions REMOVE doc IN subscriptions");
         aql.AppendLine("// FOR doc IN contains REMOVE doc IN contains");
         aql.AppendLine("// FOR doc IN defines REMOVE doc IN defines");
         aql.AppendLine("// FOR doc IN publishes REMOVE doc IN publishes");
         aql.AppendLine("// FOR doc IN consumes REMOVE doc IN consumes");
+        aql.AppendLine("// FOR doc IN subscribes REMOVE doc IN subscribes");
         aql.AppendLine("// FOR doc IN hasPublisher REMOVE doc IN hasPublisher");
         aql.AppendLine("// FOR doc IN hasConsumer REMOVE doc IN hasConsumer");
+        aql.AppendLine("// FOR doc IN hasSubscription REMOVE doc IN hasSubscription");
         aql.AppendLine();
 
         // Insert Repository documents
@@ -803,6 +945,7 @@ public class MessageFlowAnalyzer
         var repositories = report.Events.Select(e => e.Repository)
             .Union(report.Publishers.Select(p => p.Repository))
             .Union(report.Consumers.Select(c => c.Repository))
+            .Union(report.Subscriptions.Select(s => s.Repository))
             .Distinct()
             .OrderBy(r => r);
 
@@ -821,13 +964,15 @@ public class MessageFlowAnalyzer
         var services = report.Events.Select(e => new { Repository = e.Repository, Project = e.Project })
             .Union(report.Publishers.Select(p => new { Repository = p.Repository, Project = p.Project }))
             .Union(report.Consumers.Select(c => new { Repository = c.Repository, Project = c.Project }))
+            .Union(report.Subscriptions.Select(s => new { Repository = s.Repository, Project = s.Project }))
             .Distinct()
             .OrderBy(s => s.Repository).ThenBy(s => s.Project);
 
         foreach (var service in services)
         {
             var isHangfireService = report.Publishers.Any(p => p.Repository == service.Repository && p.Project == service.Project && p.IsInHangfireJob) ||
-                                   report.Consumers.Any(c => c.Repository == service.Repository && c.Project == service.Project && c.IsInHangfireJob);
+                                   report.Consumers.Any(c => c.Repository == service.Repository && c.Project == service.Project && c.IsInHangfireJob) ||
+                                   report.Subscriptions.Any(s => s.Repository == service.Repository && s.Project == service.Project && s.IsInHangfireJob);
 
             var serviceType = isHangfireService ? "Background" : "Service";
             var serviceKey = $"{SanitizeArangoKey(service.Repository)}_{SanitizeArangoKey(service.Project)}";
@@ -915,6 +1060,25 @@ public class MessageFlowAnalyzer
             aql.AppendLine();
         }
 
+        // Insert Subscription documents
+        aql.AppendLine("// ===== INSERT SUBSCRIPTIONS =====");
+        var subscriptionIndex = 0;
+        foreach (var sub in report.Subscriptions.OrderBy(s => s.EventName).ThenBy(s => s.Repository).ThenBy(s => s.SubscriptionType))
+        {
+            var subscriptionKey = $"sub_{SanitizeArangoKey(sub.Repository)}_{SanitizeArangoKey(sub.Project)}_{SanitizeArangoKey(sub.SubscriptionType)}_{subscriptionIndex++}";
+            
+            aql.AppendLine("INSERT {");
+            aql.AppendLine($"    _key: \"{subscriptionKey}\",");
+            aql.AppendLine($"    subscriptionType: \"{EscapeArangoString(sub.SubscriptionType)}\",");
+            aql.AppendLine($"    repository: \"{EscapeArangoString(sub.Repository)}\",");
+            aql.AppendLine($"    project: \"{EscapeArangoString(sub.Project)}\",");
+            aql.AppendLine($"    lineNumber: {sub.LineNumber},");
+            aql.AppendLine($"    eventName: \"{EscapeArangoString(sub.EventName)}\",");
+            aql.AppendLine($"    isHangfireJob: {sub.IsInHangfireJob.ToString().ToLower()}");
+            aql.AppendLine("} INTO subscriptions OPTIONS { overwrite: true };");
+            aql.AppendLine();
+        }
+
         // Create relationships
         aql.AppendLine("// ===== CREATE RELATIONSHIPS =====");
         aql.AppendLine();
@@ -994,10 +1158,33 @@ public class MessageFlowAnalyzer
             aql.AppendLine();
         }
 
+        // Subscription relationships
+        aql.AppendLine("// Subscription relationships");
+        subscriptionIndex = 0;
+        foreach (var sub in report.Subscriptions.OrderBy(s => s.EventName).ThenBy(s => s.Repository).ThenBy(s => s.SubscriptionType))
+        {
+            var subscriptionKey = $"sub_{SanitizeArangoKey(sub.Repository)}_{SanitizeArangoKey(sub.Project)}_{SanitizeArangoKey(sub.SubscriptionType)}_{subscriptionIndex++}";
+            var serviceKey = $"{SanitizeArangoKey(sub.Repository)}_{SanitizeArangoKey(sub.Project)}";
+            var eventKey = SanitizeArangoKey(sub.EventName);
+            
+            // Service -> Subscription
+            aql.AppendLine("INSERT {");
+            aql.AppendLine($"    _from: \"services/{serviceKey}\",");
+            aql.AppendLine($"    _to: \"subscriptions/{subscriptionKey}\"");
+            aql.AppendLine("} INTO hasSubscription;");
+            
+            // Subscription -> Event
+            aql.AppendLine("INSERT {");
+            aql.AppendLine($"    _from: \"subscriptions/{subscriptionKey}\",");
+            aql.AppendLine($"    _to: \"events/{eventKey}\"");
+            aql.AppendLine("} INTO subscribes;");
+            aql.AppendLine();
+        }
+
         // Add useful queries
         aql.AppendLine("// ===== USEFUL QUERIES =====");
         aql.AppendLine();
-        aql.AppendLine("// Show all events with their publishers and consumers");
+        aql.AppendLine("// Show all events with their publishers, consumers, and subscriptions");
         aql.AppendLine("// FOR event IN events");
         aql.AppendLine("//     LET publishers = (");
         aql.AppendLine("//         FOR pub IN publishers");
@@ -1009,10 +1196,16 @@ public class MessageFlowAnalyzer
         aql.AppendLine("//             FILTER cons.eventName == event.name");
         aql.AppendLine("//             RETURN cons.handlerClass");
         aql.AppendLine("//     )");
+        aql.AppendLine("//     LET subscriptions = (");
+        aql.AppendLine("//         FOR sub IN subscriptions");
+        aql.AppendLine("//             FILTER sub.eventName == event.name");
+        aql.AppendLine("//             RETURN CONCAT(sub.project, ' (', sub.subscriptionType, ')')");
+        aql.AppendLine("//     )");
         aql.AppendLine("//     RETURN {");
         aql.AppendLine("//         event: event.name,");
         aql.AppendLine("//         publishers: publishers,");
-        aql.AppendLine("//         consumers: consumers");
+        aql.AppendLine("//         consumers: consumers,");
+        aql.AppendLine("//         subscriptions: subscriptions");
         aql.AppendLine("//     }");
         aql.AppendLine();
         
@@ -1029,6 +1222,14 @@ public class MessageFlowAnalyzer
         aql.AppendLine("//     FILTER !hasConsumer");
         aql.AppendLine("//     RETURN { deadLetterEvent: event.name }");
         aql.AppendLine();
+
+        aql.AppendLine("// Find events with subscriptions but no consumers (potential configuration issues)");
+        aql.AppendLine("// FOR event IN events");
+        aql.AppendLine("//     LET hasConsumer = LENGTH(FOR cons IN consumers FILTER cons.eventName == event.name RETURN 1) > 0");
+        aql.AppendLine("//     LET hasSubscription = LENGTH(FOR sub IN subscriptions FILTER sub.eventName == event.name RETURN 1) > 0");
+        aql.AppendLine("//     FILTER hasSubscription && !hasConsumer");
+        aql.AppendLine("//     RETURN { event: event.name, issue: 'Subscription without handler' }");
+        aql.AppendLine();
         
         aql.AppendLine("// Show message flow between services (graph traversal)");
         aql.AppendLine("// FOR service IN services");
@@ -1044,7 +1245,8 @@ public class MessageFlowAnalyzer
         aql.AppendLine("// Find Hangfire-related flows");
         aql.AppendLine("// FOR doc IN UNION(");
         aql.AppendLine("//     (FOR pub IN publishers FILTER pub.isHangfireJob == true RETURN pub),");
-        aql.AppendLine("//     (FOR cons IN consumers FILTER cons.isHangfireJob == true RETURN cons)");
+        aql.AppendLine("//     (FOR cons IN consumers FILTER cons.isHangfireJob == true RETURN cons),");
+        aql.AppendLine("//     (FOR sub IN subscriptions FILTER sub.isHangfireJob == true RETURN sub)");
         aql.AppendLine("// )");
         aql.AppendLine("// RETURN doc");
         aql.AppendLine();
@@ -1053,12 +1255,14 @@ public class MessageFlowAnalyzer
         aql.AppendLine("// FOR service IN services");
         aql.AppendLine("//     LET publisherCount = LENGTH(FOR pub IN publishers FILTER pub.repository == service.repository && pub.project == service.name RETURN 1)");
         aql.AppendLine("//     LET consumerCount = LENGTH(FOR cons IN consumers FILTER cons.repository == service.repository && cons.project == service.name RETURN 1)");
-        aql.AppendLine("//     SORT (publisherCount + consumerCount) DESC");
+        aql.AppendLine("//     LET subscriptionCount = LENGTH(FOR sub IN subscriptions FILTER sub.repository == service.repository && sub.project == service.name RETURN 1)");
+        aql.AppendLine("//     SORT (publisherCount + consumerCount + subscriptionCount) DESC");
         aql.AppendLine("//     RETURN {");
         aql.AppendLine("//         service: service.fullName,");
         aql.AppendLine("//         publishers: publisherCount,");
         aql.AppendLine("//         consumers: consumerCount,");
-        aql.AppendLine("//         total: publisherCount + consumerCount");
+        aql.AppendLine("//         subscriptions: subscriptionCount,");
+        aql.AppendLine("//         total: publisherCount + consumerCount + subscriptionCount");
         aql.AppendLine("//     }");
         aql.AppendLine();
         
@@ -1069,8 +1273,10 @@ public class MessageFlowAnalyzer
         aql.AppendLine("//   graph_module._relation('defines', ['services'], ['events']),");
         aql.AppendLine("//   graph_module._relation('publishes', ['publishers'], ['events']),");
         aql.AppendLine("//   graph_module._relation('consumes', ['consumers'], ['events']),");
+        aql.AppendLine("//   graph_module._relation('subscribes', ['subscriptions'], ['events']),");
         aql.AppendLine("//   graph_module._relation('hasPublisher', ['services'], ['publishers']),");
-        aql.AppendLine("//   graph_module._relation('hasConsumer', ['services'], ['consumers'])");
+        aql.AppendLine("//   graph_module._relation('hasConsumer', ['services'], ['consumers']),");
+        aql.AppendLine("//   graph_module._relation('hasSubscription', ['services'], ['subscriptions'])");
         aql.AppendLine("// ]);");
 
         return aql.ToString();
@@ -1159,13 +1365,15 @@ public class MessageFlowAnalyzer
         var services = report.Events.Select(e => new { Repository = e.Repository, Project = e.Project })
             .Union(report.Publishers.Select(p => new { Repository = p.Repository, Project = p.Project }))
             .Union(report.Consumers.Select(c => new { Repository = c.Repository, Project = c.Project }))
+            .Union(report.Subscriptions.Select(s => new { Repository = s.Repository, Project = s.Project }))
             .Distinct()
             .OrderBy(s => s.Repository).ThenBy(s => s.Project);
 
         foreach (var service in services)
         {
             var isHangfireService = report.Publishers.Any(p => p.Repository == service.Repository && p.Project == service.Project && p.IsInHangfireJob) ||
-                                   report.Consumers.Any(c => c.Repository == service.Repository && c.Project == service.Project && c.IsInHangfireJob);
+                                   report.Consumers.Any(c => c.Repository == service.Repository && c.Project == service.Project && c.IsInHangfireJob) ||
+                                   report.Subscriptions.Any(s => s.Repository == service.Repository && s.Project == service.Project && s.IsInHangfireJob);
 
             var serviceType = isHangfireService ? "Background" : "Service";
             
@@ -1267,6 +1475,28 @@ public class MessageFlowAnalyzer
             // Create relationships
             cypher.AppendLine($"MERGE ({consumerNodeName})-[:CONSUMES]->(event_{SanitizeNodeName(cons.EventName)});");
             cypher.AppendLine($"MERGE (service_{SanitizeNodeName(cons.Repository)}_{SanitizeNodeName(cons.Project)})-[:HAS_CONSUMER]->({consumerNodeName});");
+        }
+        cypher.AppendLine();
+
+        // Create Subscription nodes and relationships
+        cypher.AppendLine("// Create Subscription relationships");
+        var subscriptionIndex = 0;
+        foreach (var sub in report.Subscriptions.OrderBy(s => s.EventName).ThenBy(s => s.Repository).ThenBy(s => s.SubscriptionType))
+        {
+            var subscriptionNodeName = $"subscription_{SanitizeNodeName(sub.Repository)}_{SanitizeNodeName(sub.Project)}_{SanitizeNodeName(sub.SubscriptionType)}_{subscriptionIndex++}";
+            
+            // Create subscription node
+            cypher.AppendLine($"MERGE ({subscriptionNodeName}:Subscription {{");
+            cypher.AppendLine($"    subscriptionType: '{EscapeCypherString(sub.SubscriptionType)}',");
+            cypher.AppendLine($"    repository: '{EscapeCypherString(sub.Repository)}',");
+            cypher.AppendLine($"    project: '{EscapeCypherString(sub.Project)}',");
+            cypher.AppendLine($"    lineNumber: {sub.LineNumber},");
+            cypher.AppendLine($"    isHangfireJob: {sub.IsInHangfireJob.ToString().ToLower()}");
+            cypher.AppendLine("});");
+            
+            // Create relationships
+            cypher.AppendLine($"MERGE ({subscriptionNodeName})-[:SUBSCRIBES]->(event_{SanitizeNodeName(sub.EventName)});");
+            cypher.AppendLine($"MERGE (service_{SanitizeNodeName(sub.Repository)}_{SanitizeNodeName(sub.Project)})-[:HAS_SUBSCRIPTION]->({subscriptionNodeName});");
         }
         cypher.AppendLine();
 
