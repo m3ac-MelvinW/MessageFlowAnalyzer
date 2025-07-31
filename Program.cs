@@ -19,6 +19,8 @@ namespace MessageFlowAnalyzer
                 Console.WriteLine("    --include-details      Include detailed code context");
                 Console.WriteLine("    --hangfire-only        Only show Hangfire-related messages");
                 Console.WriteLine("    --exclude-tests        Exclude test projects from analysis");
+                Console.WriteLine("    --use-source           Analyzer uses source code parsing (default)");
+                Console.WriteLine("    --use-cecil            Uses Mono.Cecil to analyze publishers (cannot be used with --use-source)");
                 return;
             }
 
@@ -29,8 +31,21 @@ namespace MessageFlowAnalyzer
             bool includeDetails = args.Contains("--include-details");
             bool hangfireOnly = args.Contains("--hangfire-only");
             bool excludeTests = args.Contains("--exclude-tests");
+            bool useCecil = args.Contains("--use-cecil");
+            bool useSource = args.Contains("--use-source");
+            
+            if (useCecil && useSource)
+            {
+                Console.WriteLine("Error: Cannot use both --use-source and --use-cecil at the same time.");
+                return;
+            }
 
-            var analyzer = new AnalyzerService();
+            if (useSource)
+            {
+                useCecil = false;
+            }
+
+            IAnalyzerService analyzer = useCecil ? new HybridAnalyzerService() : new AnalyzerService();
             await analyzer.AnalyzeAllRepositoriesAsync(
                 reposRootPath, 
                 exportJson, 
@@ -38,7 +53,8 @@ namespace MessageFlowAnalyzer
                 exportArango, 
                 includeDetails, 
                 hangfireOnly, 
-                excludeTests);
+                excludeTests,
+                useCecil);
         }
     }
 }
