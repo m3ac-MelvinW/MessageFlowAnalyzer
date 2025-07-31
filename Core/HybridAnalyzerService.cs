@@ -42,6 +42,7 @@ namespace MessageFlowAnalyzer.Core
             bool exportJson = true, 
             bool exportHtml = false, 
             bool exportArango = false, 
+            bool exportTinker = false,
             bool includeDetails = false, 
             bool hangfireOnly = false, 
             bool excludeTests = false,
@@ -100,6 +101,13 @@ namespace MessageFlowAnalyzer.Core
                 var arangoExporter = new ArangoExporter();
                 await arangoExporter.ExportAsync(report, Path.Combine(reposRootPath, "message-flow-arango.aql"));
             }
+            
+            if (exportTinker)
+            {
+                var tinkerExporter = new TinkerpopExporter();
+                await tinkerExporter.ExportAsync(report, Path.Combine(reposRootPath, "message-flow-tinkerpop.gremlin"));
+            }
+            
         }
 
         private async Task<MessageFlowReport> AnalyzeRepositoryAsync(string repoPath, bool includeDetails, bool excludeTests, bool useCecilForPublishers)

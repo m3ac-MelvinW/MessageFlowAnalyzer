@@ -30,6 +30,7 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("// 1. Create a new database in ArangoDB (e.g., 'messageflow')");
             aql.AppendLine("// 2. Run each section in the ArangoDB Web Interface");
             aql.AppendLine("// 3. Use the Graph viewer to visualize relationships");
+            aql.AppendLine("// 4. The graphLabel property provides clean display names for visualization");
             aql.AppendLine();
 
             // Create collections
@@ -88,6 +89,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine("INSERT {");
                 aql.AppendLine($"    _key: \"{SanitizeArangoKey(repo)}\",");
                 aql.AppendLine($"    name: \"{EscapeArangoString(repo)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreateRepositoryLabel(repo))}\",");
                 aql.AppendLine($"    type: \"Repository\"");
                 aql.AppendLine("} INTO repositories OPTIONS { overwrite: true };");
                 aql.AppendLine();
@@ -115,6 +117,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine($"    _key: \"{serviceKey}\",");
                 aql.AppendLine($"    name: \"{EscapeArangoString(service.Project)}\",");
                 aql.AppendLine($"    fullName: \"{EscapeArangoString(service.Repository)}/{EscapeArangoString(service.Project)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreateServiceLabel(service.Project, serviceType))}\",");
                 aql.AppendLine($"    type: \"{serviceType}\",");
                 aql.AppendLine($"    repository: \"{EscapeArangoString(service.Repository)}\"");
                 aql.AppendLine("} INTO services OPTIONS { overwrite: true };");
@@ -129,6 +132,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine($"    _key: \"{SanitizeArangoKey(evt.Name)}\",");
                 aql.AppendLine($"    name: \"{EscapeArangoString(evt.Name)}\",");
                 aql.AppendLine($"    fullName: \"{EscapeArangoString(evt.FullName)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreateEventLabel(evt.Name))}\",");
                 aql.AppendLine($"    repository: \"{EscapeArangoString(evt.Repository)}\",");
                 aql.AppendLine($"    project: \"{EscapeArangoString(evt.Project)}\",");
                 aql.AppendLine($"    type: \"IntegrationEvent\"");
@@ -159,6 +163,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine($"    _key: \"{publisherKey}\",");
                 aql.AppendLine($"    className: \"{EscapeArangoString(pub.ClassName)}\",");
                 aql.AppendLine($"    methodName: \"{EscapeArangoString(pub.MethodName)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreatePublisherLabel(pub.ClassName, pub.MethodName, pub.IsInHangfireJob))}\",");
                 aql.AppendLine($"    repository: \"{EscapeArangoString(pub.Repository)}\",");
                 aql.AppendLine($"    project: \"{EscapeArangoString(pub.Project)}\",");
                 aql.AppendLine($"    lineNumber: {pub.LineNumber},");
@@ -186,6 +191,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine($"    _key: \"{consumerKey}\",");
                 aql.AppendLine($"    handlerClass: \"{EscapeArangoString(handlerClass)}\",");
                 aql.AppendLine($"    handlerMethod: \"{EscapeArangoString(cons.HandlerMethod)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreateConsumerLabel(handlerClass, cons.IsInHangfireJob))}\",");
                 aql.AppendLine($"    repository: \"{EscapeArangoString(cons.Repository)}\",");
                 aql.AppendLine($"    project: \"{EscapeArangoString(cons.Project)}\",");
                 aql.AppendLine($"    eventName: \"{EscapeArangoString(cons.EventName)}\",");
@@ -204,6 +210,7 @@ namespace MessageFlowAnalyzer.Exporters
                 aql.AppendLine("INSERT {");
                 aql.AppendLine($"    _key: \"{subscriptionKey}\",");
                 aql.AppendLine($"    subscriptionType: \"{EscapeArangoString(sub.SubscriptionType)}\",");
+                aql.AppendLine($"    graphLabel: \"{EscapeArangoString(CreateSubscriptionLabel(sub.SubscriptionType, sub.Project, sub.IsInHangfireJob))}\",");
                 aql.AppendLine($"    repository: \"{EscapeArangoString(sub.Repository)}\",");
                 aql.AppendLine($"    project: \"{EscapeArangoString(sub.Project)}\",");
                 aql.AppendLine($"    lineNumber: {sub.LineNumber},");
@@ -322,6 +329,147 @@ namespace MessageFlowAnalyzer.Exporters
             return aql.ToString();
         }
 
+        // Graph Label Creation Methods
+        private string CreateRepositoryLabel(string repositoryName)
+        {
+            // Remove common prefixes/suffixes and make it concise
+            var label = repositoryName;
+            
+            // Remove common repository prefixes
+            var prefixesToRemove = new[] { "Company.", "Project.", "Repo.", "Repository." };
+            foreach (var prefix in prefixesToRemove)
+            {
+                if (label.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    label = label.Substring(prefix.Length);
+                    break;
+                }
+            }
+            
+            // If still too long, take the last part after the last dot
+            if (label.Length > 20 && label.Contains("."))
+            {
+                var parts = label.Split('.');
+                label = parts.Last();
+            }
+            
+            return $"📦 {label}";
+        }
+
+        private string CreateServiceLabel(string projectName, string serviceType)
+        {
+            var label = projectName;
+            
+            // Remove common suffixes to make labels cleaner
+            var suffixesToRemove = new[] { ".Service", ".API", ".Web", ".Worker", ".Job", ".Background" };
+            foreach (var suffix in suffixesToRemove)
+            {
+                if (label.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    label = label.Substring(0, label.Length - suffix.Length);
+                    break;
+                }
+            }
+            
+            // Add icon based on service type
+            var icon = serviceType == "Background" ? "⚙️" : "🔧";
+            return $"{icon} {label}";
+        }
+
+        private string CreateEventLabel(string eventName)
+        {
+            var label = eventName;
+            
+            // Remove "IntegrationEvent" suffix if present
+            if (label.EndsWith("IntegrationEvent", StringComparison.OrdinalIgnoreCase))
+            {
+                label = label.Substring(0, label.Length - "IntegrationEvent".Length);
+            }
+            else if (label.EndsWith("Event", StringComparison.OrdinalIgnoreCase))
+            {
+                label = label.Substring(0, label.Length - "Event".Length);
+            }
+            
+            // Add camel case spacing for readability
+            label = AddSpacesToCamelCase(label);
+            
+            return $"📨 {label}";
+        }
+
+        private string CreatePublisherLabel(string className, string methodName, bool isHangfireJob)
+        {
+            var classLabel = className;
+            
+            // Simplify common class name patterns
+            var suffixesToRemove = new[] { "Service", "Controller", "Handler", "Job", "Worker" };
+            foreach (var suffix in suffixesToRemove)
+            {
+                if (classLabel.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    classLabel = classLabel.Substring(0, classLabel.Length - suffix.Length);
+                    break;
+                }
+            }
+            
+            var icon = isHangfireJob ? "🔄" : "📤";
+            return $"{icon} {classLabel}.{methodName}()";
+        }
+
+        private string CreateConsumerLabel(string handlerClass, bool isHangfireJob)
+        {
+            var label = handlerClass;
+            
+            // Remove "Handler" suffix if present
+            if (label.EndsWith("Handler", StringComparison.OrdinalIgnoreCase))
+            {
+                label = label.Substring(0, label.Length - "Handler".Length);
+            }
+            
+            // Remove "IntegrationEvent" if present
+            if (label.Contains("IntegrationEvent"))
+            {
+                label = label.Replace("IntegrationEvent", "");
+            }
+            
+            var icon = isHangfireJob ? "🔄" : "📥";
+            return $"{icon} {label}";
+        }
+
+        private string CreateSubscriptionLabel(string subscriptionType, string projectName, bool isHangfireJob)
+        {
+            var projectLabel = projectName;
+            
+            // Simplify project name
+            var suffixesToRemove = new[] { ".Service", ".API", ".Web", ".Worker" };
+            foreach (var suffix in suffixesToRemove)
+            {
+                if (projectLabel.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    projectLabel = projectLabel.Substring(0, projectLabel.Length - suffix.Length);
+                    break;
+                }
+            }
+            
+            var icon = isHangfireJob ? "🔄" : "🔗";
+            return $"{icon} {projectLabel} ({subscriptionType})";
+        }
+
+        private string AddSpacesToCamelCase(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return input;
+            
+            var result = new StringBuilder();
+            for (int i = 0; i < input.Length; i++)
+            {
+                if (i > 0 && char.IsUpper(input[i]) && !char.IsUpper(input[i - 1]))
+                {
+                    result.Append(' ');
+                }
+                result.Append(input[i]);
+            }
+            return result.ToString();
+        }
+
         private void AddUsefulQueries(StringBuilder aql)
         {
             aql.AppendLine("// ===== USEFUL QUERIES =====");
@@ -331,20 +479,20 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//     LET publishers = (");
             aql.AppendLine("//         FOR pub IN publishers");
             aql.AppendLine("//             FILTER pub.eventName == event.name");
-            aql.AppendLine("//             RETURN CONCAT(pub.className, '.', pub.methodName)");
+            aql.AppendLine("//             RETURN pub.graphLabel");
             aql.AppendLine("//     )");
             aql.AppendLine("//     LET consumers = (");
             aql.AppendLine("//         FOR cons IN consumers");
             aql.AppendLine("//             FILTER cons.eventName == event.name");
-            aql.AppendLine("//             RETURN cons.handlerClass");
+            aql.AppendLine("//             RETURN cons.graphLabel");
             aql.AppendLine("//     )");
             aql.AppendLine("//     LET subscriptions = (");
             aql.AppendLine("//         FOR sub IN subscriptions");
             aql.AppendLine("//             FILTER sub.eventName == event.name");
-            aql.AppendLine("//             RETURN CONCAT(sub.project, ' (', sub.subscriptionType, ')')");
+            aql.AppendLine("//             RETURN sub.graphLabel");
             aql.AppendLine("//     )");
             aql.AppendLine("//     RETURN {");
-            aql.AppendLine("//         event: event.name,");
+            aql.AppendLine("//         event: event.graphLabel,");
             aql.AppendLine("//         publishers: publishers,");
             aql.AppendLine("//         consumers: consumers,");
             aql.AppendLine("//         subscriptions: subscriptions");
@@ -359,11 +507,11 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//                 FOR consumerService IN 1..1 INBOUND consumer hasConsumer");
             aql.AppendLine("//                     FILTER publisherService._id != consumerService._id");
             aql.AppendLine("//                     RETURN {");
-            aql.AppendLine("//                         from: publisherService.fullName,");
-            aql.AppendLine("//                         event: event.name,");
-            aql.AppendLine("//                         to: consumerService.fullName,");
-            aql.AppendLine("//                         publisher: CONCAT(publisher.className, '.', publisher.methodName),");
-            aql.AppendLine("//                         consumer: consumer.handlerClass");
+            aql.AppendLine("//                         from: publisherService.graphLabel,");
+            aql.AppendLine("//                         event: event.graphLabel,");
+            aql.AppendLine("//                         to: consumerService.graphLabel,");
+            aql.AppendLine("//                         publisher: publisher.graphLabel,");
+            aql.AppendLine("//                         consumer: consumer.graphLabel");
             aql.AppendLine("//                     }");
             aql.AppendLine();
             
@@ -371,14 +519,14 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("// FOR event IN events");
             aql.AppendLine("//     LET hasPublisher = LENGTH(FOR pub IN publishers FILTER pub.eventName == event.name RETURN 1) > 0");
             aql.AppendLine("//     FILTER !hasPublisher");
-            aql.AppendLine("//     RETURN { orphanedEvent: event.name }");
+            aql.AppendLine("//     RETURN { orphanedEvent: event.graphLabel }");
             aql.AppendLine();
             
             aql.AppendLine("// Find dead letter events (no consumers)");
             aql.AppendLine("// FOR event IN events");
             aql.AppendLine("//     LET hasConsumer = LENGTH(FOR cons IN consumers FILTER cons.eventName == event.name RETURN 1) > 0");
             aql.AppendLine("//     FILTER !hasConsumer");
-            aql.AppendLine("//     RETURN { deadLetterEvent: event.name }");
+            aql.AppendLine("//     RETURN { deadLetterEvent: event.graphLabel }");
             aql.AppendLine();
 
             aql.AppendLine("// Find events with subscriptions but no consumers (potential configuration issues)");
@@ -386,7 +534,7 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//     LET hasConsumer = LENGTH(FOR cons IN consumers FILTER cons.eventName == event.name RETURN 1) > 0");
             aql.AppendLine("//     LET hasSubscription = LENGTH(FOR sub IN subscriptions FILTER sub.eventName == event.name RETURN 1) > 0");
             aql.AppendLine("//     FILTER hasSubscription && !hasConsumer");
-            aql.AppendLine("//     RETURN { event: event.name, issue: 'Subscription without handler' }");
+            aql.AppendLine("//     RETURN { event: event.graphLabel, issue: 'Subscription without handler' }");
             aql.AppendLine();
             
             aql.AppendLine("// Show message flow between services (graph traversal)");
@@ -394,17 +542,17 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//     FOR vertex, edge, path IN 1..5 OUTBOUND service hasPublisher, publishes, consumes, hasConsumer");
             aql.AppendLine("//         FILTER IS_SAME_COLLECTION('services', vertex)");
             aql.AppendLine("//         RETURN {");
-            aql.AppendLine("//             from: service.fullName,");
-            aql.AppendLine("//             to: vertex.fullName,");
+            aql.AppendLine("//             from: service.graphLabel,");
+            aql.AppendLine("//             to: vertex.graphLabel,");
             aql.AppendLine("//             pathLength: LENGTH(path.edges)");
             aql.AppendLine("//         }");
             aql.AppendLine();
             
             aql.AppendLine("// Find Hangfire-related flows");
             aql.AppendLine("// FOR doc IN UNION(");
-            aql.AppendLine("//     (FOR pub IN publishers FILTER pub.isHangfireJob == true RETURN pub),");
-            aql.AppendLine("//     (FOR cons IN consumers FILTER cons.isHangfireJob == true RETURN cons),");
-            aql.AppendLine("//     (FOR sub IN subscriptions FILTER sub.isHangfireJob == true RETURN sub)");
+            aql.AppendLine("//     (FOR pub IN publishers FILTER pub.isHangfireJob == true RETURN { type: 'Publisher', label: pub.graphLabel, event: pub.eventName }),");
+            aql.AppendLine("//     (FOR cons IN consumers FILTER cons.isHangfireJob == true RETURN { type: 'Consumer', label: cons.graphLabel, event: cons.eventName }),");
+            aql.AppendLine("//     (FOR sub IN subscriptions FILTER sub.isHangfireJob == true RETURN { type: 'Subscription', label: sub.graphLabel, event: sub.eventName })");
             aql.AppendLine("// )");
             aql.AppendLine("// RETURN doc");
             aql.AppendLine();
@@ -416,7 +564,7 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//     LET subscriptionCount = LENGTH(FOR sub IN subscriptions FILTER sub.repository == service.repository && sub.project == service.name RETURN 1)");
             aql.AppendLine("//     SORT (publisherCount + consumerCount + subscriptionCount) DESC");
             aql.AppendLine("//     RETURN {");
-            aql.AppendLine("//         service: service.fullName,");
+            aql.AppendLine("//         service: service.graphLabel,");
             aql.AppendLine("//         publishers: publisherCount,");
             aql.AppendLine("//         consumers: consumerCount,");
             aql.AppendLine("//         subscriptions: subscriptionCount,");
@@ -436,6 +584,19 @@ namespace MessageFlowAnalyzer.Exporters
             aql.AppendLine("//   graph_module._relation('hasConsumer', ['services'], ['consumers']),");
             aql.AppendLine("//   graph_module._relation('hasSubscription', ['services'], ['subscriptions'])");
             aql.AppendLine("// ]);");
+            aql.AppendLine();
+            
+            aql.AppendLine("// Query to show all nodes with their graph labels (useful for testing)");
+            aql.AppendLine("// FOR doc IN UNION(");
+            aql.AppendLine("//     (FOR repo IN repositories RETURN { collection: 'repositories', key: repo._key, label: repo.graphLabel }),");
+            aql.AppendLine("//     (FOR service IN services RETURN { collection: 'services', key: service._key, label: service.graphLabel }),");
+            aql.AppendLine("//     (FOR event IN events RETURN { collection: 'events', key: event._key, label: event.graphLabel }),");
+            aql.AppendLine("//     (FOR pub IN publishers RETURN { collection: 'publishers', key: pub._key, label: pub.graphLabel }),");
+            aql.AppendLine("//     (FOR cons IN consumers RETURN { collection: 'consumers', key: cons._key, label: cons.graphLabel }),");
+            aql.AppendLine("//     (FOR sub IN subscriptions RETURN { collection: 'subscriptions', key: sub._key, label: sub.graphLabel })");
+            aql.AppendLine("// )");
+            aql.AppendLine("// SORT doc.collection, doc.label");
+            aql.AppendLine("// RETURN doc");
         }
 
         private string SanitizeArangoKey(string input)

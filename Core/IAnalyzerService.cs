@@ -7,6 +7,7 @@ public interface IAnalyzerService
         bool exportJson,
         bool exportHtml,
         bool exportArango,
+        bool exportTinker,
         bool includeDetails,
         bool hangfireOnly,
         bool excludeTests,
